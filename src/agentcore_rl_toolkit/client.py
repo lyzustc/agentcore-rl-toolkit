@@ -1,13 +1,17 @@
 """Client for invoking agents and collecting rollouts via S3 polling."""
 
 import json
+import logging
 import time
 import uuid
+from concurrent.futures import CancelledError
 from dataclasses import dataclass
 
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -19,12 +23,14 @@ class BatchItem:
         result: The rollout result dict (populated when success=True).
         error: Error message (populated when success=False).
         index: Index of the payload in the original payloads list.
+        elapsed: Time in seconds from request start to completion.
     """
 
     success: bool
     result: dict = None
     error: str = None
     index: int = None
+    elapsed: float = None
 
 
 class RolloutFuture:
@@ -38,12 +44,19 @@ class RolloutFuture:
         initial_interval: float = 0.5,
         max_interval: float = 30.0,
         backoff_factor: float = 1.5,
+        session_id: str = None,
+        agentcore_client=None,
+        agent_runtime_arn: str = None,
     ):
         self.s3_client = s3_client
         self.s3_bucket = s3_bucket
         self.result_key = result_key
+        self.session_id = session_id
+        self.agentcore_client = agentcore_client
+        self.agent_runtime_arn = agent_runtime_arn
         self._result = None
         self._done = False
+        self._cancelled = False
 
         # Per-future backoff state
         self._poll_interval = initial_interval
@@ -51,10 +64,15 @@ class RolloutFuture:
         self._max_interval = max_interval
         self._backoff_factor = backoff_factor
         self._last_poll_time = 0.0
+        self._start_time = time.time()  # Track when future was created
 
     def done(self) -> bool:
-        """Check if result is ready (non-blocking). Updates backoff state."""
-        if self._done:
+        """Check if result is ready (non-blocking). Updates backoff state.
+
+        Returns True if the future is in a terminal state: either the result
+        is available in S3 or the future was cancelled.
+        """
+        if self._done or self._cancelled:
             return True
         try:
             self.s3_client.head_object(Bucket=self.s3_bucket, Key=self.result_key)
@@ -79,6 +97,39 @@ class RolloutFuture:
         """Returns True if enough time has passed since last poll."""
         return self.time_until_next_poll() <= 0
 
+    def elapsed(self) -> float:
+        """Returns seconds since this future was created."""
+        return time.time() - self._start_time
+
+    def cancel(self) -> bool:
+        """Cancel the underlying ACR session (best-effort).
+
+        Sets cancelled to True once called, even if the API call fails or
+        the client/session_id are unavailable. Use ``cancelled`` to check
+        whether cancellation was *attempted*, not whether the session was
+        successfully stopped. Returns True only when the stop API call succeeds.
+        """
+        if self._cancelled:
+            return False
+        self._cancelled = True
+        if not self.agentcore_client or not self.session_id:
+            return False
+        try:
+            self.agentcore_client.stop_runtime_session(
+                agentRuntimeArn=self.agent_runtime_arn,
+                runtimeSessionId=self.session_id,
+            )
+            logger.info(f"Stopped session {self.session_id[:8]}...")
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to stop session {self.session_id[:8]}...: {e}")
+            return False
+
+    @property
+    def cancelled(self) -> bool:
+        """True if cancellation was attempted (may not have succeeded)."""
+        return self._cancelled
+
     def result(self, timeout: float = None) -> dict:
         """
         Block until result is ready, polling S3 HEAD with exponential backoff.
@@ -93,8 +144,11 @@ class RolloutFuture:
             The rollout result dictionary from S3
 
         Raises:
+            CancelledError: If the future was cancelled.
             TimeoutError: If timeout is reached before result is ready.
         """
+        if self._cancelled:
+            raise CancelledError("Future was cancelled")
         if self._result is not None:
             return self._result
 
@@ -215,18 +269,24 @@ class RolloutClient:
 
         full_payload = {**payload, "_training": rollout_config}
 
-        # Invoke via boto3
+        # Invoke via boto3 with timing
+        invoke_start = time.time()
         response = self.agentcore_client.invoke_agent_runtime(
             agentRuntimeArn=self.agent_runtime_arn,
             runtimeSessionId=session_id,
             payload=json.dumps(full_payload),
         )
+        invoke_elapsed = time.time() - invoke_start
+        logger.info(f"Invoked session {session_id[:8]}... in {invoke_elapsed:.1f}s")
 
         data = self._parse_response(response)
         return RolloutFuture(
             s3_client=self.s3_client,
             s3_bucket=data["s3_bucket"],
             result_key=data["result_key"],
+            session_id=session_id,
+            agentcore_client=self.agentcore_client,
+            agent_runtime_arn=self.agent_runtime_arn,
         )
 
     def invoke(self, payload: dict, session_id: str = None, input_id: str = None) -> RolloutFuture:
@@ -253,9 +313,11 @@ class RolloutClient:
         self,
         payloads: list[dict],
         max_concurrent_sessions: int,
+        timeout: float = 900.0,
         initial_interval: float = 0.5,
         max_interval: float = 30.0,
         backoff_factor: float = 1.5,
+        log_interval: float = 30.0,
     ) -> "BatchResult":
         """
         Run batch with full lifecycle management.
@@ -265,6 +327,8 @@ class RolloutClient:
         - Session concurrency limiting
         - Automatic completion polling via S3 HEAD with exponential backoff
         - Yielding results as they complete
+        - Per-request timeout
+        - Periodic status logging
 
         Note:
             Results are yielded in completion order, NOT input order. This is more
@@ -275,9 +339,12 @@ class RolloutClient:
             payloads: List of payloads to process
             max_concurrent_sessions: Max ACR sessions to run concurrently. Set based
                 on your ACR session quota and model API quota, etc.
+            timeout: Max seconds to wait for each request (default 900s / 15 min).
+                Requests exceeding this yield a BatchItem with success=False.
             initial_interval: Starting poll interval (default 0.5s)
             max_interval: Cap on poll interval (default 30s)
             backoff_factor: Multiply interval by this each poll (default 1.5x)
+            log_interval: Seconds between status log messages (default 30s)
 
         Returns:
             BatchResult iterator that yields BatchItem for each payload
@@ -293,9 +360,11 @@ class RolloutClient:
             client=self,
             payloads=payloads,
             max_concurrent=max_concurrent_sessions,
+            timeout=timeout,
             initial_interval=initial_interval,
             max_interval=max_interval,
             backoff_factor=backoff_factor,
+            log_interval=log_interval,
         )
 
 
@@ -307,16 +376,20 @@ class BatchResult:
         client: RolloutClient,
         payloads: list[dict],
         max_concurrent: int,
+        timeout: float = 900.0,
         initial_interval: float = 0.5,
         max_interval: float = 30.0,
         backoff_factor: float = 1.5,
+        log_interval: float = 30.0,
     ):
         self.client = client
         self.payloads = list(payloads)
         self.max_concurrent = max_concurrent
+        self.timeout = timeout
         self.initial_interval = initial_interval
         self.max_interval = max_interval
         self.backoff_factor = backoff_factor
+        self.log_interval = log_interval
 
     def __iter__(self):
         """Yield BatchItem as sessions complete, with per-future exponential backoff.
@@ -327,6 +400,7 @@ class BatchResult:
         """
         pending_payloads = list(enumerate(self.payloads))  # (index, payload)
         active_futures: dict[str, tuple[int, RolloutFuture]] = {}  # key -> (index, future)
+        last_status_log = time.time()
 
         while pending_payloads or active_futures:
             # Start new sessions up to max_concurrent (respects TPS via _rate_limited_invoke)
@@ -343,25 +417,49 @@ class BatchResult:
                     future._backoff_factor = self.backoff_factor
                     active_futures[future.result_key] = (idx, future)
                 except Exception as e:
-                    yield BatchItem(success=False, error=str(e), index=idx)
+                    yield BatchItem(success=False, error=str(e), index=idx, elapsed=0.0)
 
-            # Poll futures that are ready (per-future backoff)
+            # Poll futures that are ready (per-future backoff) and check for timeouts
             completed_keys = []
             for key, (idx, future) in active_futures.items():
-                if future.ready_to_poll() and future.done():
+                # Check for timeout first
+                if future.elapsed() > self.timeout:
+                    completed_keys.append(key)
+                    future.cancel()
+                    yield BatchItem(
+                        success=False,
+                        error=f"Timeout after {self.timeout}s",
+                        index=idx,
+                        elapsed=future.elapsed(),
+                    )
+                elif future.ready_to_poll() and future.done():
                     completed_keys.append(key)
                     try:
                         result = future.result()
-                        yield BatchItem(success=True, result=result, index=idx)
+                        yield BatchItem(success=True, result=result, index=idx, elapsed=future.elapsed())
                     except Exception as e:
-                        yield BatchItem(success=False, error=str(e), index=idx)
+                        yield BatchItem(success=False, error=str(e), index=idx, elapsed=future.elapsed())
 
             # Remove completed from active
             for key in completed_keys:
                 del active_futures[key]
 
-            # Sleep until next future is ready to poll
+            # Log status periodically
+            if active_futures and (time.time() - last_status_log) >= self.log_interval:
+                elapsed_times = [f.elapsed() for _, f in active_futures.values()]
+                min_elapsed = min(elapsed_times)
+                max_elapsed = max(elapsed_times)
+                logger.info(
+                    f"[Status] {len(active_futures)} active, {len(pending_payloads)} pending, "
+                    f"elapsed: {min_elapsed:.0f}s-{max_elapsed:.0f}s"
+                )
+                last_status_log = time.time()
+
+            # Sleep until next poll or timeout, whichever comes first
             if active_futures and not completed_keys:
                 min_wait = min(f.time_until_next_poll() for _, f in active_futures.values())
+                if self.timeout:
+                    min_timeout_wait = min(self.timeout - f.elapsed() for _, f in active_futures.values())
+                    min_wait = min(min_wait, max(0, min_timeout_wait))
                 if min_wait > 0:
                     time.sleep(min_wait)
