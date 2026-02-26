@@ -5,13 +5,14 @@ Toolkit to Seamlessly Enable RL Training on Any Agent with Bedrock AgentCore.
 
 ## Overview
 
-**AgentCore RL Toolkit (ART)** is an SDK that helps developers train their LLM agents using reinforcement learning (RL) with **AWS Bedrock AgentCore Runtime (ACR)**. It extends [bedrock-agentcore-sdk-python](https://github.com/aws/bedrock-agentcore-sdk-python/tree/main) to help adapt any existing production agents for RL training with minimal code changes.
+**AgentCore RL Toolkit (ART)** is an SDK that helps developers adapt their production LLM agents for online RL training with **AWS Bedrock AgentCore Runtime (ACR)**. It extends [bedrock-agentcore-sdk-python](https://github.com/aws/bedrock-agentcore-sdk-python/tree/main) so most of your production agent code can be directly reused.
 
-The toolkit handles the complexity of:
-- **Rollout collection**: Automatically captures agent interactions (conversations, tool calls, etc.) during RL training episodes
-- **ACR integration**: Works seamlessly with ACR's auto-scaling and session management for efficient parallel rollout generation
-- **Data pipeline**: S3 storage for asynchronous rollout delivery to training engines
-- **Reward interface**: Provides a standard base class for implementing custom reward functions
+LLM agent rollouts are long-running — an agent may run for minutes or hours making tool calls. The toolkit manages this with an async-first design:
+
+- **Agent Adaptation** (`AgentCoreRLApp`, `vLLMModel`): Adapt your production agent for RL training inside ACR — the `@rollout_entrypoint` decorator runs your agent in the background with fire-and-forget semantics, collecting token-level data, computing rewards, and saving results to S3.
+- **Simplified Rollout Collection** (`RolloutClient`, `RolloutFuture`): Submit rollout requests and collect results asynchronously with a future-based API, built-in concurrency control, rate limiting, and S3 polling — for both training loops and batch evaluation.
+
+Both components use S3 as their data layer, but the complexity is fully abstracted — your code never reads from or writes to S3 directly.
 
 ## Installation
 
@@ -26,9 +27,9 @@ uv add agentcore-rl-toolkit
 
 To try the example agent applications without installing the package, each example under `examples/` has standalone dependencies. See individual example READMEs (e.g., `examples/strands_math_agent/README.md`).
 
-### What is Bedrock AgentCore Runtime (ACR)?
+## What is Bedrock AgentCore Runtime (ACR)?
 
-ACR is AWS's serverless runtime for deploying LLM agents, which can be viewed as **Lambda functions with session continuity**:
+ACR is AWS's serverless runtime for deploying LLM agents, which can be viewed as **Long-running Lambda functions (up to 8 hours) with session continuity**:
 
 - **Session routing**: Requests with the same session ID route to the same container, enabling multi-turn interactions with persistent state
 - **Session isolation**: Different session IDs use separate runtime sessions (microVMs), providing strong security isolation between concurrent requests
@@ -37,13 +38,15 @@ ACR is AWS's serverless runtime for deploying LLM agents, which can be viewed as
 
 While session routing is valuable for multi-turn production agents, RL rollouts typically run as single invocations. However, the other properties—**session isolation**, **auto-scaling**, and **sandboxed execution**—still make ACR particularly well-suited for **online RL training**, which requires running many parallel agent rollouts with tool uses securely and efficiently. ACR handles the infrastructure complexity while you focus on agent logic and reward design. After training, you can deploy your fine-tuned model on the same ACR stack with minimal code changes—enabling a fast path from experimentation to production.
 
-### Key Features
+## Key Features
 
-- **Minimal migration effort**: Convert your production agent to RL-ready with a simple decorator change (`@app.entrypoint` → `@app.rollout_entrypoint`)
-- **Framework support**: Built-in support for Strands framework with extensible architecture for other frameworks
-- **Fire-and-forget pattern**: Background async processing eliminates brittle long-lived TCP connections
-- **S3-based result delivery**: Rollout results stored in S3, polled via efficient S3 HEAD requests
-- **Production-ready**: Direct code reuse from production agents ensures training reflects real deployment behavior
+- **Minimal code changes**: Adapt your production agent with a decorator swap (`@app.entrypoint` → `@app.rollout_entrypoint`) and model replacement — most of your agent code stays the same
+- **Token-accurate rollout data**: `vLLMModel` collects token IDs and logprobs directly from the inference server, avoiding retokenization issues that cause training instability
+- **Async end-to-end**: Fire-and-forget server + future-based client — no long-lived TCP connections needed for long-running agent rollouts
+- **Simplified rollout collection**: `RolloutClient` manages concurrency, rate limiting, and S3 result polling out of the box for both training loops and batch evaluation
+- **Production parity**: Direct code reuse from production agents ensures training behavior matches real deployment
+
+## Agent-Side: Adapting Your Agent for RL
 
 ### Starting Point: A Deployment-Ready Agent
 
@@ -63,8 +66,8 @@ model = BedrockModel(model_id="us.anthropic.claude-sonnet-4-20250514-v1:0")
 agent = Agent(model=model, tools=[...], system_prompt="...")
 
 @app.entrypoint
-async def invoke_agent(payload):
-    response = await agent.invoke_async(payload.get("prompt"))
+def invoke_agent(payload):
+    response = agent(payload.get("prompt"))
     return response.message["content"][0]["text"]
 
 if __name__ == "__main__":
@@ -86,7 +89,7 @@ reward_fn = GSM8KReward()  # user-defined reward function
 def invoke_agent(payload: dict):
     base_url = payload["_rollout"]["base_url"]
     model_id = payload["_rollout"]["model_id"]
-    model = vLLMModel(client_args={"api_key": "abc", "base_url": base_url}, model_id=model_id)
+    model = vLLMModel(client_args={"api_key": "EMPTY", "base_url": base_url}, model_id=model_id)
     agent = Agent(model=model, tools=[...], system_prompt="...")
 
     response = agent(payload.get("prompt"))
@@ -104,6 +107,64 @@ def invoke_agent(payload: dict):
 
 **Why create model and agent inside the entrypoint?** During RL training, the training engine can pass runtime configuration—such as inference server address, sampling parameters, and system prompt—via the `_rollout` payload, giving flexibility to accommodate different learning scenarios. This is safe because RL rollouts are single-invocation: the agent doesn't need persistent conversation history across requests, so there's no need to define model and agent as global variables.
 
+## Client-Side: Invoking Agents and Collecting Results
+
+LLM agent rollouts are long-running and asynchronous — an agent may run for minutes or even hours as it reasons and makes tool calls. Both sides of this toolkit are designed around that constraint:
+
+- **Agent side** (`@rollout_entrypoint`): Fire-and-forget — the HTTP response returns immediately while the agent runs in the background, saving rollout results to S3 when done. Covered above.
+- **Client-side** (`RolloutClient` / `RolloutFuture`): Submits requests and provides a future-based API to collect results asynchronously as they complete. Covered here.
+
+### Training Integration (`invoke()` + `RolloutFuture`)
+
+For training loops (e.g., GRPO), use `client.invoke()` to submit individual rollouts and collect results with fine-grained control:
+
+```python
+from agentcore_rl_toolkit import RolloutClient
+
+client = RolloutClient(
+    agent_runtime_arn="arn:aws:bedrock-agentcore:us-west-2:123456789:runtime/abc",
+    s3_bucket="my-rollout-bucket",
+    exp_id="grpo-run-1",
+    base_url="http://vllm-server:8000/v1",
+    model_id="my-model",
+)
+
+# Submit rollouts for each input (non-blocking)
+futures = []
+for input in inputs:
+    for _ in range(num_rollouts_per_input):
+        f = client.invoke(
+            payload={"prompt": input["prompt"], "answer": input["answer"]},
+            input_id=input["id"],
+        )
+        futures.append(f)
+
+# Collect results grouped by input_id
+from collections import defaultdict
+results_by_input = defaultdict(list)
+for f in futures:
+    result = f.result(timeout=600)
+    results_by_input[f.input_id].append(result)
+```
+
+**How the future lifecycle works:**
+- **`client.invoke()`** sends the request to ACR and returns a `RolloutFuture` immediately — this means ACR has received the request and a background agent session is processing it.
+- **`future.result(timeout=...)`** blocks until the result appears in S3, polling with exponential backoff internally. It returns the complete rollout data (token IDs, rewards, etc.) once the agent finishes and writes to S3.
+
+### Batch Evaluation (`run_batch()`)
+
+For evaluation, `run_batch()` provides a higher-level API that manages concurrency, timeouts, and polling automatically:
+
+```python
+for item in client.run_batch(payloads, max_concurrent_sessions=100):
+    if item.success:
+        print(f"Payload {item.index}: rewards={item.result['rewards']}")
+    else:
+        print(f"Payload {item.index} failed: {item.error}")
+```
+
+See [`examples/strands_migration_agent/evaluate.py`](examples/strands_migration_agent/evaluate.py) for a full evaluation script.
+
 ## Start Training on Example Agents
 
 ### High-Level Training Architecture
@@ -119,9 +180,9 @@ The training architecture follows a **decoupled design** where agent rollouts an
 │       └───────┬─────────────┘    └───────▲─────────────┘       │
 │               │                          │                     │
 └───────────────┼──────────────────────────┼─────────────────────┘
-                │ 1. Submit N prompts      │ 2. Model inference
-                │    to ACR                │    calls from agents
-                ▼                          │
+                │ 1. Submit N prompts      │                        ◄── ART Client-Side (1): RolloutClient
+                │    to ACR                │ 2. Model inference     ◄── ART Agent-Side (2): vLLMModel
+                ▼                          │    calls from agents
 ┌────────────────────────────────────────────────────────────────┐
 │                  AWS Bedrock AgentCore Runtime                 │
 │        ┌───────────┐  ┌───────────┐       ┌───────────┐        │
@@ -130,23 +191,23 @@ The training architecture follows a **decoupled design** where agent rollouts an
 │        └─────┬─────┘  └─────┬─────┘       └─────┬─────┘        │
 │              │              │                   │              │
 │              └──────────────┴───────────────────┘              │
-│                             │ 3. Save rollouts + rewards       │
+│                             │ 3. Save rollouts + rewards       │  ◄── ART Agent-Side (3): @rollout_entrypoint
 │                             ▼                                  │
 │                   ┌───────────────────┐                        │
 │                   │  S3 (rollouts)    │                        │
 │                   └─────────┬─────────┘                        │
 └─────────────────────────────┼──────────────────────────────────┘
-                              │ 4. Poll S3 HEAD for results
+                              │ 4. Poll S3 HEAD for results         ◄── ART Client-Side (4): RolloutFuture
                               ▼
                   Training Engine receives
                   rollouts for policy update
 ```
 
 **Workflow:**
-1. **Prompt submission**: Training engine submits N prompts to ACR, which auto-scales to spin up N parallel agent sessions
-2. **Agent execution**: Each agent session processes its prompt, calling the inference server for model responses
-3. **Rollout collection**: Agents save rollouts and rewards to S3
-4. **Policy update**: Training engine polls S3 for completed rollouts and updates the model
+1. **Prompt submission**: Training engine uses `RolloutClient` to submit N prompts to ACR — it injects rollout configs (`input_id`, `s3_bucket`, etc.) and handles rate limiting and concurrency, while ACR auto-scales N parallel agent sessions
+2. **Agent execution**: Each agent session runs the `@rollout_entrypoint`, which launches the agent loop asynchronously (reporting `/ping` as busy) and calls the inference server via `vLLMModel` for model responses
+3. **Rollout collection**: When the agent finishes, `@rollout_entrypoint` saves rollouts and rewards to S3 and reports `/ping` as idle so ACR can reclaim the session
+4. **Policy update**: Training engine uses `RolloutFuture` to poll S3 for completed rollouts and updates the model
 
 This architecture enables parallel and highly efficient rollouts with secure execution during RL training. The decoupled design means training libraries only need the agent's container image to start training—agent code and dependencies stay completely separate from the training library.
 
